@@ -27,6 +27,7 @@ extern "C" {
 #define BW_HD_LOOK_KEY "BlueWake.HDLook"                 // bool, applies at launch (hd_look.h)
 #define BW_DPAD_MENUS_KEY "BlueWake.DpadMenus"           // bool, applies at once (dpad_menus.h, #245)
 #define BW_GYRO_AIM_KEY "BlueWake.GyroAim"               // bool, applies at once (gyro_aim.h, #188)
+#define BW_DRAG_LOOK_KEY "BlueWake.DragLook"           // bool, drag to look on touch (off by default)
 // Better Wind Waker's settings (game options, runtime/host/src/game_options.h):
 // BW_OPTION_KEY_PREFIX + the option's name, a bool set only once the player
 // changes it from its default; applies at launch.

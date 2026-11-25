@@ -341,6 +341,8 @@ static UIAlertAction* BWHDAction(UIAlertController* alert, NSString* title, UIAl
 - (void)endLayoutEditing;
 - (void)clearTouchInput;
 - (void)tapIdentifier:(NSString*)identifier holdSeconds:(double)hold;
+- (void)refreshDragLook;
+- (void)endCameraDrag;
 @end
 
 static void BWDumpMenu(UIMenuElement* element, int depth) {
@@ -365,6 +367,13 @@ static void BWDumpMenu(UIMenuElement* element, int depth) {
     BOOL _menuStale; // a switch changed while the menu stayed open
     BWStickView* _moveStick;
     BWStickView* _cStick;
+    // Drag to look (see cameraDrag* below): one drag at a time on the empty
+    // right half of the screen.
+    UITouch* _dragTouch;
+    CGPoint _dragLastPoint;
+    float _dragHoldX, _dragHoldY;
+    CADisplayLink* _dragDisplayLink;
+    NSTimeInterval _dragLastMoveTime;
     UIView* _dpadGroup;
     NSMutableArray<BWGameButton*>* _buttons;
     NSMutableArray<UIGestureRecognizer*>* _editGestures;
@@ -553,6 +562,7 @@ static void BWDumpMenu(UIMenuElement* element, int depth) {
 
 - (void)refreshMenu {
     _menuButton.menu = [self buildMenu];
+    [self refreshDragLook];
 }
 
 // Switches that keep the menu open (#104): the open submenu keeps its identity
@@ -731,6 +741,7 @@ static void BWDumpMenu(UIMenuElement* element, int depth) {
     };
     UIMenu* cameraMenu = [UIMenu menuWithTitle:@"Camera Stick" image:[UIImage systemImageNamed:@"camera.rotate"]
                                     identifier:nil options:0 children:@[
+        toggle(@"Drag to Look", BW_DRAG_LOOK_KEY),
         toggle(@"Invert Horizontal", BW_INVERT_CAMERA_X_KEY),
         toggle(@"Invert Vertical", BW_INVERT_CAMERA_Y_KEY),
     ]];
@@ -1997,6 +2008,7 @@ static NSString* BWQuestLogSummary(const BWQuestLog& log) {
     _dpadGroup.userInteractionEnabled = NO;
     [self addSubview:_dpadGroup];
     [self addEditGestures:_dpadGroup];
+    [self refreshDragLook];
 }
 
 - (BWStickView*)makeStick {
@@ -2121,6 +2133,10 @@ static NSString* BWQuestLogSummary(const BWQuestLog& log) {
 
 - (void)clearTouchInput {
     // Clear the overlay's state too: the next touch republishes the whole pad.
+    _dragTouch = nil;
+    _dragHoldX = _dragHoldY = 0.0f;
+    [_dragDisplayLink invalidate];
+    _dragDisplayLink = nil;
     for (BWGameButton* button in _buttons)
         button.transform = CGAffineTransformIdentity;
     _pad = BlueWakeTouchPad{};
@@ -2128,6 +2144,126 @@ static NSString* BWQuestLogSummary(const BWQuestLog& log) {
     [_cStick reset];
     _pad = BlueWakeTouchPad{};
     bluewake_touch_clear();
+}
+
+// ---------------------------------------------------------------- drag to look
+
+// Drag to look (BW_DRAG_LOOK_KEY, off by default): a finger drag on the empty
+// right half of the screen turns the camera, instead of the spring-centred
+// camera stick. The drag feeds the same C-stick channel the stick uses
+// (stick:movedX:y: above), so the camera turns at the game's own C-stick rate
+// — the same speed as holding the stick at full tilt. While the finger moves,
+// the drag holds a deflection proportional to its speed (8 points of travel
+// between touch events is full tilt); when the finger stops or lifts, the
+// deflection decays to zero within a fraction of a second, so the camera
+// eases to a stop instead of spinning on. The camera stick itself is hidden
+// while drag to look is on (refreshDragLook); turning the setting off brings
+// it back.
+static const CGFloat kDragLookFullTiltPoints = 8.0;  // points per touch event
+static const NSTimeInterval kDragLookDecayAfter = 0.025;  // still seconds before decay
+static const CGFloat kDragLookDecayPerFrame = 0.5;  // halve the held deflection per frame
+
+- (BOOL)dragLookEnabled {
+    return BWBoolDefault(@BW_DRAG_LOOK_KEY, NO);
+}
+
+- (void)refreshDragLook {
+    _cStick.hidden = [self dragLookEnabled];
+    if (_cStick.hidden)
+        [self endCameraDrag];
+}
+
+- (void)publishCameraDrag {
+    [self stick:_cStick movedX:_dragHoldX y:_dragHoldY];
+}
+
+- (void)startCameraDrag:(UITouch*)touch {
+    _dragTouch = touch;
+    _dragLastPoint = [touch locationInView:self];
+    _dragHoldX = _dragHoldY = 0.0f;
+    _dragLastMoveTime = CFAbsoluteTimeGetCurrent();
+    if (_dragDisplayLink == nil) {
+        _dragDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(cameraDragTick)];
+        [_dragDisplayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    }
+}
+
+- (void)cameraDragMoved:(UITouch*)touch {
+    if (touch != _dragTouch)
+        return;
+    CGPoint p = [touch locationInView:self];
+    CGFloat dx = p.x - _dragLastPoint.x;
+    CGFloat dy = p.y - _dragLastPoint.y;
+    _dragLastPoint = p;
+    _dragLastMoveTime = CFAbsoluteTimeGetCurrent();
+    // Same signs as the stick: right is +x, up is +y (screen y points down).
+    _dragHoldX = (float)std::clamp(dx / kDragLookFullTiltPoints, -1.0, 1.0);
+    _dragHoldY = (float)std::clamp(-dy / kDragLookFullTiltPoints, -1.0, 1.0);
+    [self publishCameraDrag];
+}
+
+- (void)cameraDragTick {
+    if (_dragTouch == nil && _dragHoldX == 0.0f && _dragHoldY == 0.0f) {
+        [_dragDisplayLink invalidate];
+        _dragDisplayLink = nil;
+        return;
+    }
+    if (CFAbsoluteTimeGetCurrent() - _dragLastMoveTime < kDragLookDecayAfter)
+        return;
+    _dragHoldX *= (float)kDragLookDecayPerFrame;
+    _dragHoldY *= (float)kDragLookDecayPerFrame;
+    if (fabsf(_dragHoldX) < 0.02f)
+        _dragHoldX = 0.0f;
+    if (fabsf(_dragHoldY) < 0.02f)
+        _dragHoldY = 0.0f;
+    [self publishCameraDrag];
+    if (_dragTouch == nil && _dragHoldX == 0.0f && _dragHoldY == 0.0f) {
+        [_dragDisplayLink invalidate];
+        _dragDisplayLink = nil;
+    }
+}
+
+- (void)endCameraDrag {
+    _dragTouch = nil;
+    // The display link keeps running until the held deflection has decayed to
+    // zero (cameraDragTick stops it); if there is nothing held, stop it now.
+    if (_dragHoldX == 0.0f && _dragHoldY == 0.0f) {
+        [_dragDisplayLink invalidate];
+        _dragDisplayLink = nil;
+    }
+}
+
+// Empty space on the right half of the screen is the drag area while drag to
+// look is on. Touches on a control still go to that control; everywhere else
+// the touch falls through to the game view, as before.
+- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+    UIView* hit = [super hitTest:point withEvent:event];
+    if (hit != nil)
+        return hit;
+    if ([self dragLookEnabled] && !_editing && ![self touchControlsHidden] &&
+        point.x > CGRectGetMidX(self.bounds))
+        return self;
+    return nil;
+}
+
+- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    if (_dragTouch == nil && [self dragLookEnabled] && !_editing && ![self touchControlsHidden])
+        [self startCameraDrag:touches.anyObject];
+}
+
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    for (UITouch* touch in touches)
+        [self cameraDragMoved:touch];
+}
+
+- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    if (_dragTouch != nil && [touches containsObject:_dragTouch])
+        [self endCameraDrag];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    if (_dragTouch != nil && [touches containsObject:_dragTouch])
+        [self endCameraDrag];
 }
 
 // ---------------------------------------------------------------- layout
